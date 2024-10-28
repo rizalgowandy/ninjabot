@@ -9,13 +9,15 @@ import (
 	"github.com/rodrigo-brito/ninjabot/plot"
 	"github.com/rodrigo-brito/ninjabot/plot/indicator"
 	"github.com/rodrigo-brito/ninjabot/storage"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/rodrigo-brito/ninjabot/tools/log"
 )
 
+// This example shows how to use backtesting with NinjaBot
+// Backtesting is a simulation of the strategy in historical data (from CSV)
 func main() {
 	ctx := context.Background()
 
+	// bot settings (eg: pairs, telegram, etc)
 	settings := ninjabot.Settings{
 		Pairs: []string{
 			"BTCUSDT",
@@ -23,8 +25,10 @@ func main() {
 		},
 	}
 
+	// initialize your strategy
 	strategy := new(strategies.CrossEMA)
 
+	// load historical data from CSV files
 	csvFeed, err := exchange.NewCSVFeed(
 		strategy.Timeframe(),
 		exchange.PairFeed{
@@ -42,11 +46,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// initialize a database in memory
 	storage, err := storage.FromMemory()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// create a paper wallet for simulation, initializing with 10.000 USDT
 	wallet := exchange.NewPaperWallet(
 		ctx,
 		"USDT",
@@ -54,23 +60,28 @@ func main() {
 		exchange.WithDataFeed(csvFeed),
 	)
 
-	chart, err := plot.NewChart(plot.WithIndicators(
-		indicator.EMA(8, "red"),
-		indicator.EMA(21, "#000"),
-		indicator.RSI(14, "purple"),
-		indicator.Stoch(8, 3, 3, "red", "blue"),
-	), plot.WithPaperWallet(wallet))
+	// create a chart  with indicators from the strategy and a custom additional RSI indicator
+	chart, err := plot.NewChart(
+		plot.WithStrategyIndicators(strategy),
+		plot.WithCustomIndicators(
+			indicator.RSI(14, "purple"),
+		),
+		plot.WithPaperWallet(wallet),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// initializer Ninjabot with the objects created before
 	bot, err := ninjabot.NewBot(
 		ctx,
 		settings,
 		wallet,
 		strategy,
-		ninjabot.WithBacktest(wallet),
+		ninjabot.WithBacktest(wallet), // Required for Backtest mode
 		ninjabot.WithStorage(storage),
+
+		// connect bot feed (candle and orders) to the chart
 		ninjabot.WithCandleSubscription(chart),
 		ninjabot.WithOrderSubscription(chart),
 		ninjabot.WithLogLevel(log.WarnLevel),
@@ -79,6 +90,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Initializer simulation
 	err = bot.Run(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -87,7 +99,7 @@ func main() {
 	// Print bot results
 	bot.Summary()
 
-	// Display candlesticks chart in browser
+	// Display candlesticks chart in local browser
 	err = chart.Start()
 	if err != nil {
 		log.Fatal(err)

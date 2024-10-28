@@ -5,14 +5,18 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/rodrigo-brito/ninjabot/plot"
+	"github.com/rodrigo-brito/ninjabot/plot/indicator"
+
 	"github.com/rodrigo-brito/ninjabot"
 	"github.com/rodrigo-brito/ninjabot/examples/strategies"
 	"github.com/rodrigo-brito/ninjabot/exchange"
 	"github.com/rodrigo-brito/ninjabot/storage"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/rodrigo-brito/ninjabot/tools/log"
 )
 
+// This example shows how to use NinjaBot with a simulation with a fake exchange
+// A peperwallet is a wallet that is not connected to any exchange, it is a simulation with live data (realtime)
 func main() {
 	var (
 		ctx             = context.Background()
@@ -28,7 +32,7 @@ func main() {
 			"LTCUSDT",
 		},
 		Telegram: ninjabot.TelegramSettings{
-			Enabled: true,
+			Enabled: telegramToken != "" && telegramUser != 0,
 			Token:   telegramToken,
 			Users:   []int{telegramUser},
 		},
@@ -47,6 +51,7 @@ func main() {
 	}
 
 	// creating a paper wallet to simulate an exchange waller for fake operataions
+	// paper wallet is simulation of a real exchange wallet
 	paperWallet := exchange.NewPaperWallet(
 		ctx,
 		"USDT",
@@ -58,6 +63,16 @@ func main() {
 	// initializing my strategy
 	strategy := new(strategies.CrossEMA)
 
+	chart, err := plot.NewChart(
+		plot.WithCustomIndicators(
+			indicator.EMA(8, "red"),
+			indicator.SMA(21, "blue"),
+		),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// initializer ninjabot
 	bot, err := ninjabot.NewBot(
 		ctx,
@@ -66,13 +81,22 @@ func main() {
 		strategy,
 		ninjabot.WithStorage(storage),
 		ninjabot.WithPaperWallet(paperWallet),
+		ninjabot.WithCandleSubscription(chart),
+		ninjabot.WithOrderSubscription(chart),
 	)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatal(err)
 	}
+
+	go func() {
+		err := chart.Start()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	err = bot.Run(ctx)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatal(err)
 	}
 }

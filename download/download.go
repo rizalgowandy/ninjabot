@@ -6,19 +6,20 @@ import (
 	"os"
 	"time"
 
-	"github.com/rodrigo-brito/ninjabot/service"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/schollz/progressbar/v3"
 	"github.com/xhit/go-str2duration/v2"
+
+	"github.com/rodrigo-brito/ninjabot/service"
+	"github.com/rodrigo-brito/ninjabot/tools/log"
 )
 
 const batchSize = 500
 
 type Downloader struct {
-	exchange service.Exchange
+	exchange service.Feeder
 }
 
-func NewDownloader(exchange service.Exchange) Downloader {
+func NewDownloader(exchange service.Feeder) Downloader {
 	return Downloader{
 		exchange: exchange,
 	}
@@ -59,6 +60,7 @@ func (d Downloader) Download(ctx context.Context, pair, timeframe string, output
 	if err != nil {
 		return err
 	}
+	defer recordFile.Close()
 
 	now := time.Now()
 	parameters := &Parameters{
@@ -72,21 +74,43 @@ func (d Downloader) Download(ctx context.Context, pair, timeframe string, output
 
 	parameters.Start = time.Date(parameters.Start.Year(), parameters.Start.Month(), parameters.Start.Day(),
 		0, 0, 0, 0, time.UTC)
-	parameters.End = time.Date(parameters.End.Year(), parameters.End.Month(), parameters.End.Day(),
-		0, 0, 0, 0, time.UTC)
+
+	if now.Sub(parameters.End) > 0 {
+		parameters.End = time.Date(parameters.End.Year(), parameters.End.Month(), parameters.End.Day(),
+			0, 0, 0, 0, time.UTC)
+	} else {
+		parameters.End = now
+	}
 
 	candlesCount, interval, err := candlesCount(parameters.Start, parameters.End, timeframe)
 	if err != nil {
 		return err
 	}
+	candlesCount++
 
 	log.Infof("Downloading %d candles of %s for %s", candlesCount, timeframe, pair)
-
+	info := d.exchange.AssetsInfo(pair)
 	writer := csv.NewWriter(recordFile)
+
+	progressBar := progressbar.Default(int64(candlesCount))
+	lostData := 0
+	isLastLoop := false
+
+	// write headers
+	err = writer.Write([]string{
+		"time", "open", "close", "low", "high", "volume",
+	})
+	if err != nil {
+		return err
+	}
+
 	for begin := parameters.Start; begin.Before(parameters.End); begin = begin.Add(interval * batchSize) {
 		end := begin.Add(interval * batchSize)
-		if end.After(parameters.End) {
+		if end.Before(parameters.End) {
+			end = end.Add(-1 * time.Second)
+		} else {
 			end = parameters.End
+			isLastLoop = true
 		}
 
 		candles, err := d.exchange.CandlesByPeriod(ctx, pair, timeframe, begin, end)
@@ -95,12 +119,30 @@ func (d Downloader) Download(ctx context.Context, pair, timeframe string, output
 		}
 
 		for _, candle := range candles {
-			err := writer.Write(candle.ToSlice())
+			err := writer.Write(candle.ToSlice(info.QuotePrecision))
 			if err != nil {
 				return err
 			}
 		}
+
+		countCandles := len(candles)
+		if !isLastLoop {
+			lostData += batchSize - countCandles
+		}
+
+		if err = progressBar.Add(countCandles); err != nil {
+			log.Warnf("update progresbar fail: %s", err.Error())
+		}
 	}
+
+	if err = progressBar.Close(); err != nil {
+		log.Warnf("close progresbar fail: %s", err.Error())
+	}
+
+	if lostData > 0 {
+		log.Warnf("%d missing candles", lostData)
+	}
+
 	writer.Flush()
 	log.Info("Done!")
 	return writer.Error()

@@ -1,6 +1,7 @@
 package notification
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -17,8 +18,8 @@ import (
 )
 
 var (
-	buyRegexp  = regexp.MustCompile(`/buy\s+(?P<pair>\w+)\s+(?P<amount>[0-9]+(?:\.\d+)?)(?P<percent>%)?`)
-	sellRegexp = regexp.MustCompile(`/sell\s+(?P<pair>\w+)\s+(?P<amount>[0-9]+(?:\.\d+)?)(?P<percent>%)?`)
+	buyRegexp  = regexp.MustCompile(`/buy\s+(?P<pair>\w+)\s+(?P<amount>\d+(?:\.\d+)?)(?P<percent>%)?`)
+	sellRegexp = regexp.MustCompile(`/sell\s+(?P<pair>\w+)\s+(?P<amount>\d+(?:\.\d+)?)(?P<percent>%)?`)
 )
 
 type telegram struct {
@@ -41,7 +42,7 @@ func NewTelegram(controller *order.Controller, settings model.Settings, options 
 		}
 
 		for _, user := range settings.Telegram.Users {
-			if u.Message.Sender.ID == user {
+			if int(u.Message.Sender.ID) == user {
 				return true
 			}
 		}
@@ -114,7 +115,7 @@ func NewTelegram(controller *order.Controller, settings model.Settings, options 
 func (t telegram) Start() {
 	go t.client.Start()
 	for _, id := range t.settings.Telegram.Users {
-		_, err := t.client.Send(&tb.User{ID: id}, "Bot initialized.", t.defaultMenu)
+		_, err := t.client.Send(&tb.User{ID: int64(id)}, "Bot initialized.", t.defaultMenu)
 		if err != nil {
 			log.Error(err)
 		}
@@ -123,7 +124,7 @@ func (t telegram) Start() {
 
 func (t telegram) Notify(text string) {
 	for _, user := range t.settings.Telegram.Users {
-		_, err := t.client.Send(&tb.User{ID: user}, text)
+		_, err := t.client.Send(&tb.User{ID: int64(user)}, text)
 		if err != nil {
 			log.Error(err)
 		}
@@ -135,18 +136,28 @@ func (t telegram) BalanceHandle(m *tb.Message) {
 	quotesValue := make(map[string]float64)
 	total := 0.0
 
+	account, err := t.orderController.Account()
+	if err != nil {
+		log.Error(err)
+		t.OnError(err)
+		return
+	}
+
 	for _, pair := range t.settings.Pairs {
 		assetPair, quotePair := exchange.SplitAssetQuote(pair)
-		assetSize, quoteSize, err := t.orderController.Position(pair)
+		assetBalance, quoteBalance := account.Balance(assetPair, quotePair)
+
+		assetSize := assetBalance.Free + assetBalance.Lock
+		quoteSize := quoteBalance.Free + quoteBalance.Lock
+
+		quote, err := t.orderController.LastQuote(pair)
 		if err != nil {
-			t.OrError(err)
+			log.Error(err)
+			t.OnError(err)
+			return
 		}
 
-		assetValue, err := t.orderController.PositionValue(pair)
-		if err != nil {
-			t.OrError(err)
-		}
-
+		assetValue := assetSize * quote
 		quotesValue[quotePair] = quoteSize
 		total += assetValue
 		message += fmt.Sprintf("%s: `%.4f` ≅ `%.2f` %s \n", assetPair, assetSize, assetValue, quotePair)
@@ -159,7 +170,7 @@ func (t telegram) BalanceHandle(m *tb.Message) {
 
 	message += fmt.Sprintf("-----\nTotal: `%.4f`\n", total)
 
-	_, err := t.client.Send(m.Sender, message)
+	_, err = t.client.Send(m.Sender, message)
 	if err != nil {
 		log.Error(err)
 	}
@@ -168,7 +179,9 @@ func (t telegram) BalanceHandle(m *tb.Message) {
 func (t telegram) HelpHandle(m *tb.Message) {
 	commands, err := t.client.GetCommands()
 	if err != nil {
-		t.OrError(err)
+		log.Error(err)
+		t.OnError(err)
+		return
 	}
 
 	lines := make([]string, 0, len(commands))
@@ -219,7 +232,8 @@ func (t telegram) BuyHandle(m *tb.Message) {
 	pair := strings.ToUpper(command["pair"])
 	amount, err := strconv.ParseFloat(command["amount"], 64)
 	if err != nil {
-		t.OrError(err)
+		log.Error(err)
+		t.OnError(err)
 		return
 	} else if amount <= 0 {
 		_, err := t.client.Send(m.Sender, "Invalid amount")
@@ -232,7 +246,8 @@ func (t telegram) BuyHandle(m *tb.Message) {
 	if command["percent"] != "" {
 		_, quote, err := t.orderController.Position(pair)
 		if err != nil {
-			t.OrError(err)
+			log.Error(err)
+			t.OnError(err)
 			return
 		}
 
@@ -241,10 +256,9 @@ func (t telegram) BuyHandle(m *tb.Message) {
 
 	order, err := t.orderController.CreateOrderMarketQuote(model.SideTypeBuy, pair, amount)
 	if err != nil {
-		t.OrError(err)
 		return
 	}
-	t.OnOrder(order)
+	log.Info("[TELEGRAM]: BUY ORDER CREATED: ", order)
 }
 
 func (t telegram) SellHandle(m *tb.Message) {
@@ -267,7 +281,8 @@ func (t telegram) SellHandle(m *tb.Message) {
 	pair := strings.ToUpper(command["pair"])
 	amount, err := strconv.ParseFloat(command["amount"], 64)
 	if err != nil {
-		t.OrError(err)
+		log.Error(err)
+		t.OnError(err)
 		return
 	} else if amount <= 0 {
 		_, err := t.client.Send(m.Sender, "Invalid amount")
@@ -280,26 +295,23 @@ func (t telegram) SellHandle(m *tb.Message) {
 	if command["percent"] != "" {
 		asset, _, err := t.orderController.Position(pair)
 		if err != nil {
-			t.OrError(err)
 			return
 		}
 
 		amount = amount * asset / 100.0
 		order, err := t.orderController.CreateOrderMarket(model.SideTypeSell, pair, amount)
 		if err != nil {
-			t.OrError(err)
 			return
 		}
-		t.OnOrder(order)
+		log.Info("[TELEGRAM]: SELL ORDER CREATED: ", order)
 		return
 	}
 
 	order, err := t.orderController.CreateOrderMarketQuote(model.SideTypeSell, pair, amount)
 	if err != nil {
-		t.OrError(err)
 		return
 	}
-	t.OnOrder(order)
+	log.Info("[TELEGRAM]: SELL ORDER CREATED: ", order)
 }
 
 func (t telegram) StatusHandle(m *tb.Message) {
@@ -356,9 +368,20 @@ func (t telegram) OnOrder(order model.Order) {
 	t.Notify(message)
 }
 
-func (t telegram) OrError(err error) {
-	log.Error(err)
+func (t telegram) OnError(err error) {
 	title := "🛑 ERROR"
-	message := fmt.Sprintf("%s\n-----\n%s", title, err)
-	t.Notify(message)
+
+	var orderError *exchange.OrderError
+	if errors.As(err, &orderError) {
+		message := fmt.Sprintf(`%s
+		-----
+		Pair: %s
+		Quantity: %.4f
+		-----
+		%s`, title, orderError.Pair, orderError.Quantity, orderError.Err)
+		t.Notify(message)
+		return
+	}
+
+	t.Notify(fmt.Sprintf("%s\n-----\n%s", title, err))
 }

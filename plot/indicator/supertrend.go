@@ -22,13 +22,17 @@ type supertrend struct {
 	Period         int
 	Factor         float64
 	Color          string
-	Close          model.Series
-	BasicUpperBand model.Series
-	FinalUpperBand model.Series
-	BasicLowerBand model.Series
-	FinalLowerBand model.Series
-	SuperTrend     model.Series
+	Close          model.Series[float64]
+	BasicUpperBand model.Series[float64]
+	FinalUpperBand model.Series[float64]
+	BasicLowerBand model.Series[float64]
+	FinalLowerBand model.Series[float64]
+	SuperTrend     model.Series[float64]
 	Time           []time.Time
+}
+
+func (s supertrend) Warmup() int {
+	return s.Period
 }
 
 func (s supertrend) Name() string {

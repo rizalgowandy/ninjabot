@@ -10,17 +10,19 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/rodrigo-brito/ninjabot/model"
-
+	"github.com/samber/lo"
 	"github.com/xhit/go-str2duration/v2"
+
+	"github.com/rodrigo-brito/ninjabot/model"
 )
 
 var ErrInsufficientData = errors.New("insufficient data")
 
 type PairFeed struct {
-	Pair      string
-	File      string
-	Timeframe string
+	Pair       string
+	File       string
+	Timeframe  string
+	HeikinAshi bool
 }
 
 type CSVFeed struct {
@@ -28,6 +30,41 @@ type CSVFeed struct {
 	CandlePairTimeFrame map[string][]model.Candle
 }
 
+func (c CSVFeed) AssetsInfo(pair string) model.AssetInfo {
+	asset, quote := SplitAssetQuote(pair)
+	return model.AssetInfo{
+		BaseAsset:          asset,
+		QuoteAsset:         quote,
+		MaxPrice:           math.MaxFloat64,
+		MaxQuantity:        math.MaxFloat64,
+		StepSize:           0.00000001,
+		TickSize:           0.00000001,
+		QuotePrecision:     8,
+		BaseAssetPrecision: 8,
+	}
+}
+
+func parseHeaders(headers []string) (index map[string]int, additional []string, ok bool) {
+	headerMap := map[string]int{
+		"time": 0, "open": 1, "close": 2, "low": 3, "high": 4, "volume": 5,
+	}
+
+	_, err := strconv.Atoi(headers[0])
+	if err == nil {
+		return headerMap, additional, false
+	}
+
+	for index, h := range headers {
+		if _, ok := headerMap[h]; !ok {
+			additional = append(additional, h)
+		}
+		headerMap[h] = index
+	}
+
+	return headerMap, additional, true
+}
+
+// NewCSVFeed creates a new data feed from CSV files and resample
 func NewCSVFeed(targetTimeframe string, feeds ...PairFeed) (*CSVFeed, error) {
 	csvFeed := &CSVFeed{
 		Feeds:               make(map[string]PairFeed),
@@ -48,41 +85,64 @@ func NewCSVFeed(targetTimeframe string, feeds ...PairFeed) (*CSVFeed, error) {
 		}
 
 		var candles []model.Candle
+		ha := model.NewHeikinAshi()
+
+		// map each header label with its index
+		headerMap, additionalHeaders, hasCustomHeaders := parseHeaders(csvLines[0])
+		if hasCustomHeaders {
+			csvLines = csvLines[1:]
+		}
+
 		for _, line := range csvLines {
-			timestamp, err := strconv.Atoi(line[0])
+			timestamp, err := strconv.Atoi(line[headerMap["time"]])
 			if err != nil {
 				return nil, err
 			}
 
 			candle := model.Candle{
-				Time:     time.Unix(int64(timestamp), 0).UTC(),
-				Pair:     feed.Pair,
-				Complete: true,
+				Time:      time.Unix(int64(timestamp), 0).UTC(),
+				UpdatedAt: time.Unix(int64(timestamp), 0).UTC(),
+				Pair:      feed.Pair,
+				Complete:  true,
 			}
 
-			candle.Open, err = strconv.ParseFloat(line[1], 64)
+			candle.Open, err = strconv.ParseFloat(line[headerMap["open"]], 64)
 			if err != nil {
 				return nil, err
 			}
 
-			candle.Close, err = strconv.ParseFloat(line[2], 64)
+			candle.Close, err = strconv.ParseFloat(line[headerMap["close"]], 64)
 			if err != nil {
 				return nil, err
 			}
 
-			candle.Low, err = strconv.ParseFloat(line[3], 64)
+			candle.Low, err = strconv.ParseFloat(line[headerMap["low"]], 64)
 			if err != nil {
 				return nil, err
 			}
 
-			candle.High, err = strconv.ParseFloat(line[4], 64)
+			candle.High, err = strconv.ParseFloat(line[headerMap["high"]], 64)
 			if err != nil {
 				return nil, err
 			}
 
-			candle.Volume, err = strconv.ParseFloat(line[5], 64)
+			candle.Volume, err = strconv.ParseFloat(line[headerMap["volume"]], 64)
 			if err != nil {
 				return nil, err
+			}
+
+			if hasCustomHeaders {
+				candle.Metadata = make(map[string]float64)
+				for _, header := range additionalHeaders {
+					candle.Metadata[header], err = strconv.ParseFloat(line[headerMap[header]], 64)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+
+			if feed.HeikinAshi {
+				candle = candle.ToHeikinAshi(ha)
 			}
 
 			candles = append(candles, candle)
@@ -101,6 +161,20 @@ func NewCSVFeed(targetTimeframe string, feeds ...PairFeed) (*CSVFeed, error) {
 
 func (c CSVFeed) feedTimeframeKey(pair, timeframe string) string {
 	return fmt.Sprintf("%s--%s", pair, timeframe)
+}
+
+func (c CSVFeed) LastQuote(_ context.Context, _ string) (float64, error) {
+	return 0, errors.New("invalid operation")
+}
+
+func (c *CSVFeed) Limit(duration time.Duration) *CSVFeed {
+	for pair, candles := range c.CandlePairTimeFrame {
+		start := candles[len(candles)-1].Time.Add(-duration)
+		c.CandlePairTimeFrame[pair] = lo.Filter(candles, func(candle model.Candle, _ int) bool {
+			return candle.Time.After(start)
+		})
+	}
+	return c
 }
 
 func isFistCandlePeriod(t time.Time, fromTimeframe, targetTimeframe string) (bool, error) {
@@ -186,7 +260,6 @@ func (c *CSVFeed) resample(pair, sourceTimeframe, targetTimeframe string) error 
 			candle.High = math.Max(candles[lastIndex].High, candle.High)
 			candle.Low = math.Min(candles[lastIndex].Low, candle.Low)
 			candle.Volume += candles[lastIndex].Volume
-			candle.Trades += candles[lastIndex].Trades
 		}
 		candles = append(candles, candle)
 	}

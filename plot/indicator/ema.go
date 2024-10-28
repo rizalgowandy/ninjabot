@@ -20,8 +20,12 @@ func EMA(period int, color string) plot.Indicator {
 type ema struct {
 	Period int
 	Color  string
-	Values model.Series
+	Values model.Series[float64]
 	Time   []time.Time
+}
+
+func (e ema) Warmup() int {
+	return e.Period
 }
 
 func (e ema) Name() string {

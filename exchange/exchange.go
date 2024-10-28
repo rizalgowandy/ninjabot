@@ -7,11 +7,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/StudioSol/set"
+
 	"github.com/rodrigo-brito/ninjabot/model"
 	"github.com/rodrigo-brito/ninjabot/service"
-
-	"github.com/StudioSol/set"
-	log "github.com/sirupsen/logrus"
+	"github.com/rodrigo-brito/ninjabot/tools/log"
 )
 
 var (
@@ -30,12 +30,21 @@ type DataFeedSubscription struct {
 	Feeds                   *set.LinkedHashSetString
 	DataFeeds               map[string]*DataFeed
 	SubscriptionsByDataFeed map[string][]Subscription
-	SubscriptionsFinish     []func()
 }
 
 type Subscription struct {
 	onCandleClose bool
 	consumer      DataFeedConsumer
+}
+
+type OrderError struct {
+	Err      error
+	Pair     string
+	Quantity float64
+}
+
+func (o *OrderError) Error() string {
+	return fmt.Sprintf("order error: %v", o.Err)
 }
 
 type DataFeedConsumer func(model.Candle)
@@ -67,10 +76,6 @@ func (d *DataFeedSubscription) Subscribe(pair, timeframe string, consumer DataFe
 	})
 }
 
-func (d *DataFeedSubscription) OnFinish(onClose func()) {
-	d.SubscriptionsFinish = append(d.SubscriptionsFinish, onClose)
-}
-
 func (d *DataFeedSubscription) Preload(pair, timeframe string, candles []model.Candle) {
 	log.Infof("[SETUP] preloading %d candles for %s-%s", len(candles), pair, timeframe)
 	key := d.feedKey(pair, timeframe)
@@ -97,7 +102,7 @@ func (d *DataFeedSubscription) Connect() {
 	}
 }
 
-func (d *DataFeedSubscription) Start() {
+func (d *DataFeedSubscription) Start(loadSync bool) {
 	d.Connect()
 	wg := new(sync.WaitGroup)
 	for key, feed := range d.DataFeeds {
@@ -126,12 +131,7 @@ func (d *DataFeedSubscription) Start() {
 	}
 
 	log.Infof("Data feed connected.")
-	wg.Wait()
-
-	// send signal for all finish subscriptions
-	for _, finish := range d.SubscriptionsFinish {
-		finish()
+	if loadSync {
+		wg.Wait()
 	}
-
-	log.Infof("Data feed disconnected.")
 }

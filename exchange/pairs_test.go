@@ -15,6 +15,7 @@ func TestSplitAssetQuote(t *testing.T) {
 		{"BTCUSDT", "BTC", "USDT"},
 		{"ETHBTC", "ETH", "BTC"},
 		{"BTCBUSD", "BTC", "BUSD"},
+		{"1000SHIBBUSD", "1000SHIB", "BUSD"},
 	}
 
 	for _, tc := range tt {
@@ -24,4 +25,10 @@ func TestSplitAssetQuote(t *testing.T) {
 			require.Equal(t, tc.Quote, quote)
 		})
 	}
+}
+
+func TestUpdatePairFile(t *testing.T) {
+	t.Skip() // it is not a test, just utility function to update pairs list
+	err := updatePairsFile()
+	require.NoError(t, err)
 }

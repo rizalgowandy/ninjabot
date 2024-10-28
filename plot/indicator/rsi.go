@@ -20,8 +20,12 @@ func RSI(period int, color string) plot.Indicator {
 type rsi struct {
 	Period int
 	Color  string
-	Values model.Series
+	Values model.Series[float64]
 	Time   []time.Time
+}
+
+func (e rsi) Warmup() int {
+	return e.Period
 }
 
 func (e rsi) Name() string {

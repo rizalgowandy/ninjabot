@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rodrigo-brito/ninjabot/service"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/adshao/go-binance/v2/common"
 
 	"github.com/rodrigo-brito/ninjabot/model"
+	"github.com/rodrigo-brito/ninjabot/service"
+	"github.com/rodrigo-brito/ninjabot/tools/log"
 )
 
 type assetInfo struct {
@@ -28,21 +28,36 @@ type AssetValue struct {
 
 type PaperWallet struct {
 	sync.Mutex
-	ctx          context.Context
-	baseCoin     string
-	counter      int64
-	takerFee     float64
-	makerFee     float64
-	initialValue float64
-	feeder       service.Feeder
-	orders       []model.Order
-	assets       map[string]*assetInfo
-	avgPrice     map[string]float64
-	volume       map[string]float64
-	lastCandle   map[string]model.Candle
-	fistCandle   map[string]model.Candle
-	assetValues  map[string][]AssetValue
-	equityValues []AssetValue
+	ctx           context.Context
+	baseCoin      string
+	counter       int64
+	takerFee      float64
+	makerFee      float64
+	initialValue  float64
+	feeder        service.Feeder
+	orders        []model.Order
+	assets        map[string]*assetInfo
+	avgShortPrice map[string]float64
+	avgLongPrice  map[string]float64
+	volume        map[string]float64
+	lastCandle    map[string]model.Candle
+	fistCandle    map[string]model.Candle
+	assetValues   map[string][]AssetValue
+	equityValues  []AssetValue
+}
+
+func (p *PaperWallet) AssetsInfo(pair string) model.AssetInfo {
+	asset, quote := SplitAssetQuote(pair)
+	return model.AssetInfo{
+		BaseAsset:          asset,
+		QuoteAsset:         quote,
+		MaxPrice:           math.MaxFloat64,
+		MaxQuantity:        math.MaxFloat64,
+		StepSize:           0.00000001,
+		TickSize:           0.00000001,
+		QuotePrecision:     8,
+		BaseAssetPrecision: 8,
+	}
 }
 
 type PaperWalletOption func(*PaperWallet)
@@ -71,16 +86,17 @@ func WithDataFeed(feeder service.Feeder) PaperWalletOption {
 
 func NewPaperWallet(ctx context.Context, baseCoin string, options ...PaperWalletOption) *PaperWallet {
 	wallet := PaperWallet{
-		ctx:          ctx,
-		baseCoin:     baseCoin,
-		orders:       make([]model.Order, 0),
-		assets:       make(map[string]*assetInfo),
-		fistCandle:   make(map[string]model.Candle),
-		lastCandle:   make(map[string]model.Candle),
-		avgPrice:     make(map[string]float64),
-		volume:       make(map[string]float64),
-		assetValues:  make(map[string][]AssetValue),
-		equityValues: make([]AssetValue, 0),
+		ctx:           ctx,
+		baseCoin:      baseCoin,
+		orders:        make([]model.Order, 0),
+		assets:        make(map[string]*assetInfo),
+		fistCandle:    make(map[string]model.Candle),
+		lastCandle:    make(map[string]model.Candle),
+		avgShortPrice: make(map[string]float64),
+		avgLongPrice:  make(map[string]float64),
+		volume:        make(map[string]float64),
+		assetValues:   make(map[string][]AssetValue),
+		equityValues:  make([]AssetValue, 0),
 	}
 
 	for _, option := range options {
@@ -105,6 +121,10 @@ func (p *PaperWallet) Pairs() []string {
 		pairs = append(pairs, pair)
 	}
 	return pairs
+}
+
+func (p *PaperWallet) LastQuote(ctx context.Context, pair string) (float64, error) {
+	return p.feeder.LastQuote(ctx, pair)
 }
 
 func (p *PaperWallet) AssetValues(pair string) []AssetValue {
@@ -161,50 +181,192 @@ func (p *PaperWallet) Summary() {
 		volume       float64
 	)
 
-	fmt.Println("--------------")
-	fmt.Println("WALLET SUMMARY")
-	fmt.Println("--------------")
-
-	for pair, price := range p.avgPrice {
+	fmt.Println("----- FINAL WALLET -----")
+	for pair := range p.lastCandle {
 		asset, quote := SplitAssetQuote(pair)
-		quantity := p.assets[asset].Free + p.assets[asset].Lock
-		total += quantity * price
+		assetInfo, ok := p.assets[asset]
+		if !ok {
+			continue
+		}
+
+		quantity := assetInfo.Free + assetInfo.Lock
+		value := quantity * p.lastCandle[pair].Close
+		if quantity < 0 {
+			totalShort := 2.0*p.avgShortPrice[pair]*quantity - p.lastCandle[pair].Close*quantity
+			value = math.Abs(totalShort)
+		}
+		total += value
 		marketChange += (p.lastCandle[pair].Close - p.fistCandle[pair].Close) / p.fistCandle[pair].Close
-		fmt.Printf("%f %s = %f %s\n", quantity, asset, total, quote)
+		fmt.Printf("%.4f %s = %.4f %s\n", quantity, asset, total, quote)
 	}
 
-	fmt.Println()
-	fmt.Println("TRADING VOLUME")
-	for pair, vol := range p.volume {
-		volume += vol
-		fmt.Printf("%s        = %.2f %s\n", pair, vol, p.baseCoin)
-	}
-	fmt.Println()
-
-	avgMarketChange := marketChange / float64(len(p.avgPrice))
+	avgMarketChange := marketChange / float64(len(p.lastCandle))
 	baseCoinValue := p.assets[p.baseCoin].Free + p.assets[p.baseCoin].Lock
 	profit := total + baseCoinValue - p.initialValue
+	fmt.Printf("%.4f %s\n", baseCoinValue, p.baseCoin)
+	fmt.Println()
 	maxDrawDown, _, _ := p.MaxDrawdown()
-	fmt.Printf("%f %s\n", baseCoinValue, p.baseCoin)
-	fmt.Println("--------------")
-	fmt.Printf("START PORTFOLIO = %.2f %s\n", p.initialValue, p.baseCoin)
-	fmt.Printf("FINAL PORTFOLIO = %.2f %s\n", total+baseCoinValue, p.baseCoin)
-	fmt.Printf("GROSS PROFIT    =  %f %s (%.2f%%)\n", profit, p.baseCoin, profit/p.initialValue*100)
-	fmt.Printf("MARKET (B&H)    =  %.2f%%\n", avgMarketChange*100)
-	fmt.Printf("MAX DRAWDOWN    =  %.2f %%\n", maxDrawDown*100)
-	fmt.Printf("VOLUME          =  %.2f %s\n", volume, p.baseCoin)
-	fmt.Printf("COSTS (0.001*V) =  %.2f %s (ESTIMATION) \n", volume*0.001, p.baseCoin)
-	fmt.Println("--------------")
+	fmt.Println("----- RETURNS -----")
+	fmt.Printf("START PORTFOLIO     = %.2f %s\n", p.initialValue, p.baseCoin)
+	fmt.Printf("FINAL PORTFOLIO     = %.2f %s\n", total+baseCoinValue, p.baseCoin)
+	fmt.Printf("GROSS PROFIT        =  %f %s (%.2f%%)\n", profit, p.baseCoin, profit/p.initialValue*100)
+	fmt.Printf("MARKET CHANGE (B&H) =  %.2f%%\n", avgMarketChange*100)
+	fmt.Println()
+	fmt.Println("------ RISK -------")
+	fmt.Printf("MAX DRAWDOWN = %.2f %%\n", maxDrawDown*100)
+	fmt.Println()
+	fmt.Println("------ VOLUME -----")
+	for pair, vol := range p.volume {
+		volume += vol
+		fmt.Printf("%s         = %.2f %s\n", pair, vol, p.baseCoin)
+	}
+	fmt.Printf("TOTAL           = %.2f %s\n", volume, p.baseCoin)
+	fmt.Println("-------------------")
 }
 
-func (p *PaperWallet) lockFunds(asset string, amount float64) error {
-	if value, ok := p.assets[asset]; !ok || value.Free < amount {
-		return ErrInsufficientFunds
+func (p *PaperWallet) validateFunds(side model.SideType, pair string, amount, value float64, fill bool) error {
+	asset, quote := SplitAssetQuote(pair)
+	if _, ok := p.assets[asset]; !ok {
+		p.assets[asset] = &assetInfo{}
 	}
-	p.assets[asset].Free = p.assets[asset].Free - amount
-	p.assets[asset].Lock = p.assets[asset].Lock + amount
-	log.Infof("%s -> LOCK = %f / FREE %f", asset, p.assets[asset].Lock, p.assets[asset].Free)
+
+	if _, ok := p.assets[quote]; !ok {
+		p.assets[quote] = &assetInfo{}
+	}
+
+	funds := p.assets[quote].Free
+	if side == model.SideTypeSell {
+		if p.assets[asset].Free > 0 {
+			funds += p.assets[asset].Free * value
+		}
+
+		if funds < amount*value {
+			return &OrderError{
+				Err:      ErrInsufficientFunds,
+				Pair:     pair,
+				Quantity: amount,
+			}
+		}
+
+		lockedAsset := math.Min(math.Max(p.assets[asset].Free, 0), amount) // ignore negative asset amount to lock
+		lockedQuote := (amount - lockedAsset) * value
+
+		p.assets[asset].Free -= lockedAsset
+		p.assets[quote].Free -= lockedQuote
+		if fill {
+			p.updateAveragePrice(side, pair, amount, value)
+			if lockedQuote > 0 { // entering in short position
+				p.assets[asset].Free -= amount
+			} else { // liquidating long position
+				p.assets[quote].Free += amount * value
+
+			}
+		} else {
+			p.assets[asset].Lock += lockedAsset
+			p.assets[quote].Lock += lockedQuote
+		}
+
+		log.Debugf("%s -> LOCK = %f / FREE %f", asset, p.assets[asset].Lock, p.assets[asset].Free)
+	} else { // SideTypeBuy
+		var liquidShortValue float64
+		if p.assets[asset].Free < 0 {
+			v := math.Abs(p.assets[asset].Free)
+			liquidShortValue = 2*v*p.avgShortPrice[pair] - v*value // liquid price of short position
+			funds += liquidShortValue
+		}
+
+		amountToBuy := amount
+		if p.assets[asset].Free < 0 {
+			amountToBuy = amount + p.assets[asset].Free
+		}
+
+		if funds < amountToBuy*value {
+			return &OrderError{
+				Err:      ErrInsufficientFunds,
+				Pair:     pair,
+				Quantity: amount,
+			}
+		}
+
+		lockedAsset := math.Min(-math.Min(p.assets[asset].Free, 0), amount) // ignore positive amount to lock
+		lockedQuote := (amount-lockedAsset)*value - liquidShortValue
+
+		p.assets[asset].Free += lockedAsset
+		p.assets[quote].Free -= lockedQuote
+
+		if fill {
+			p.updateAveragePrice(side, pair, amount, value)
+			p.assets[asset].Free += amount - lockedAsset
+		} else {
+			p.assets[asset].Lock += lockedAsset
+			p.assets[quote].Lock += lockedQuote
+		}
+		log.Debugf("%s -> LOCK = %f / FREE %f", asset, p.assets[asset].Lock, p.assets[asset].Free)
+	}
+
 	return nil
+}
+
+func (p *PaperWallet) updateAveragePrice(side model.SideType, pair string, amount, value float64) {
+	actualQty := 0.0
+	asset, quote := SplitAssetQuote(pair)
+
+	if p.assets[asset] != nil {
+		actualQty = p.assets[asset].Free
+	}
+
+	// without previous position
+	if actualQty == 0 {
+		if side == model.SideTypeBuy {
+			p.avgLongPrice[pair] = value
+		} else {
+			p.avgShortPrice[pair] = value
+		}
+		return
+	}
+
+	// actual long + order buy
+	if actualQty > 0 && side == model.SideTypeBuy {
+		positionValue := p.avgLongPrice[pair] * actualQty
+		p.avgLongPrice[pair] = (positionValue + amount*value) / (actualQty + amount)
+		return
+	}
+
+	// actual long + order sell
+	if actualQty > 0 && side == model.SideTypeSell {
+		profitValue := amount*value - math.Min(amount, actualQty)*p.avgLongPrice[pair]
+		percentage := profitValue / (amount * p.avgLongPrice[pair])
+		log.Infof("PROFIT = %.4f %s (%.2f %%)", profitValue, quote, percentage*100.0) // TODO: store profits
+
+		if amount <= actualQty { // not enough quantity to close the position
+			return
+		}
+
+		p.avgShortPrice[pair] = value
+
+		return
+	}
+
+	// actual short + order sell
+	if actualQty < 0 && side == model.SideTypeSell {
+		positionValue := p.avgShortPrice[pair] * -actualQty
+		p.avgShortPrice[pair] = (positionValue + amount*value) / (-actualQty + amount)
+
+		return
+	}
+
+	// actual short + order buy
+	if actualQty < 0 && side == model.SideTypeBuy {
+		profitValue := math.Min(amount, -actualQty)*p.avgShortPrice[pair] - amount*value
+		percentage := profitValue / (amount * p.avgShortPrice[pair])
+		log.Infof("PROFIT = %.4f %s (%.2f %%)", profitValue, quote, percentage*100.0) // TODO: store profits
+
+		if amount <= -actualQty { // not enough quantity to close the position
+			return
+		}
+
+		p.avgLongPrice[pair] = value
+	}
 }
 
 func (p *PaperWallet) OnCandle(candle model.Candle) {
@@ -226,21 +388,19 @@ func (p *PaperWallet) OnCandle(candle model.Candle) {
 		}
 
 		asset, quote := SplitAssetQuote(order.Pair)
-		if order.Side == model.SideTypeBuy && order.Price <= candle.Close {
+		if order.Side == model.SideTypeBuy && order.Price >= candle.Close {
 			if _, ok := p.assets[asset]; !ok {
 				p.assets[asset] = &assetInfo{}
 			}
 
-			actualQty := p.assets[asset].Free + p.assets[asset].Lock
-			orderVolume := order.Price * order.Quantity
-			walletValue := p.avgPrice[candle.Pair] * actualQty
-
-			p.volume[candle.Pair] += orderVolume
+			p.volume[candle.Pair] += order.Price * order.Quantity
 			p.orders[i].UpdatedAt = candle.Time
 			p.orders[i].Status = model.OrderStatusTypeFilled
-			p.avgPrice[candle.Pair] = (walletValue + orderVolume) / (actualQty + order.Quantity)
+
+			// update assets size
+			p.updateAveragePrice(order.Side, order.Pair, order.Quantity, order.Price)
 			p.assets[asset].Free = p.assets[asset].Free + order.Quantity
-			p.assets[quote].Lock = p.assets[quote].Lock - orderVolume
+			p.assets[quote].Lock = p.assets[quote].Lock - order.Price*order.Quantity
 		}
 
 		if order.Side == model.SideTypeSell {
@@ -276,13 +436,13 @@ func (p *PaperWallet) OnCandle(candle model.Candle) {
 			}
 
 			orderVolume := order.Quantity * orderPrice
-			profitValue := order.Quantity*orderPrice - order.Quantity*p.avgPrice[candle.Pair]
-			percentage := profitValue / (order.Quantity * p.avgPrice[candle.Pair])
-			log.Infof("PROFIT = %.4f %s (%.2f %%)", profitValue, quote, percentage*100)
 
 			p.volume[candle.Pair] += orderVolume
 			p.orders[i].UpdatedAt = candle.Time
 			p.orders[i].Status = model.OrderStatusTypeFilled
+
+			// update assets size
+			p.updateAveragePrice(order.Side, order.Pair, order.Quantity, orderPrice)
 			p.assets[asset].Lock = p.assets[asset].Lock - order.Quantity
 			p.assets[quote].Free = p.assets[quote].Free + order.Quantity*orderPrice
 		}
@@ -293,7 +453,14 @@ func (p *PaperWallet) OnCandle(candle model.Candle) {
 		for asset, info := range p.assets {
 			amount := info.Free + info.Lock
 			pair := strings.ToUpper(asset + p.baseCoin)
-			total += amount * p.lastCandle[pair].Close
+			if amount < 0 {
+				v := math.Abs(amount)
+				liquid := 2*v*p.avgShortPrice[pair] - v*p.lastCandle[pair].Close
+				total += liquid
+			} else {
+				total += amount * p.lastCandle[pair].Close
+			}
+
 			p.assetValues[asset] = append(p.assetValues[asset], AssetValue{
 				Time:  candle.Time,
 				Value: amount * p.lastCandle[pair].Close,
@@ -312,9 +479,9 @@ func (p *PaperWallet) Account() (model.Account, error) {
 	balances := make([]model.Balance, 0)
 	for pair, info := range p.assets {
 		balances = append(balances, model.Balance{
-			Tick: pair,
-			Free: info.Free,
-			Lock: info.Lock,
+			Asset: pair,
+			Free:  info.Free,
+			Lock:  info.Lock,
 		})
 	}
 
@@ -333,8 +500,7 @@ func (p *PaperWallet) Position(pair string) (asset, quote float64, err error) {
 		return 0, 0, err
 	}
 
-	assetBalance := acc.Balance(assetTick)
-	quoteBalance := acc.Balance(quoteTick)
+	assetBalance, quoteBalance := acc.Balance(assetTick, quoteTick)
 
 	return assetBalance.Free + assetBalance.Lock, quoteBalance.Free + quoteBalance.Lock, nil
 }
@@ -344,9 +510,11 @@ func (p *PaperWallet) CreateOrderOCO(side model.SideType, pair string,
 	p.Lock()
 	defer p.Unlock()
 
-	asset, _ := SplitAssetQuote(pair)
+	if size == 0 {
+		return nil, ErrInvalidQuantity
+	}
 
-	err := p.lockFunds(asset, size)
+	err := p.validateFunds(side, pair, size, price, false)
 	if err != nil {
 		return nil, err
 	}
@@ -391,17 +559,13 @@ func (p *PaperWallet) CreateOrderLimit(side model.SideType, pair string,
 	p.Lock()
 	defer p.Unlock()
 
-	asset, quote := SplitAssetQuote(pair)
-	if side == model.SideTypeSell {
-		err := p.lockFunds(asset, size)
-		if err != nil {
-			return model.Order{}, err
-		}
-	} else {
-		err := p.lockFunds(quote, size*limit)
-		if err != nil {
-			return model.Order{}, err
-		}
+	if size == 0 {
+		return model.Order{}, ErrInvalidQuantity
+	}
+
+	err := p.validateFunds(side, pair, size, limit, false)
+	if err != nil {
+		return model.Order{}, err
 	}
 	order := model.Order{
 		ExchangeID: p.ID(),
@@ -425,28 +589,43 @@ func (p *PaperWallet) CreateOrderMarket(side model.SideType, pair string, size f
 	return p.createOrderMarket(side, pair, size)
 }
 
+func (p *PaperWallet) CreateOrderStop(pair string, size float64, limit float64) (model.Order, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	if size == 0 {
+		return model.Order{}, ErrInvalidQuantity
+	}
+
+	err := p.validateFunds(model.SideTypeSell, pair, size, limit, false)
+	if err != nil {
+		return model.Order{}, err
+	}
+
+	order := model.Order{
+		ExchangeID: p.ID(),
+		CreatedAt:  p.lastCandle[pair].Time,
+		UpdatedAt:  p.lastCandle[pair].Time,
+		Pair:       pair,
+		Side:       model.SideTypeSell,
+		Type:       model.OrderTypeStopLossLimit,
+		Status:     model.OrderStatusTypeNew,
+		Price:      limit,
+		Stop:       &limit,
+		Quantity:   size,
+	}
+	p.orders = append(p.orders, order)
+	return order, nil
+}
+
 func (p *PaperWallet) createOrderMarket(side model.SideType, pair string, size float64) (model.Order, error) {
-	asset, quote := SplitAssetQuote(pair)
-	if side == model.SideTypeSell {
-		if value, ok := p.assets[asset]; !ok || value.Free < size {
-			return model.Order{}, ErrInsufficientFunds
-		}
-		if _, ok := p.assets[quote]; !ok {
-			p.assets[quote] = &assetInfo{}
-		}
-		p.assets[asset].Free = p.assets[asset].Free - size
-		p.assets[quote].Free = p.assets[quote].Free + p.lastCandle[pair].Close*size
-	} else {
-		if value, ok := p.assets[quote]; !ok || value.Free < size*p.lastCandle[pair].Close {
-			return model.Order{}, ErrInsufficientFunds
-		}
-		if _, ok := p.assets[asset]; !ok {
-			p.assets[asset] = &assetInfo{}
-		}
-		actualQty := p.assets[asset].Free + p.assets[asset].Lock
-		p.avgPrice[pair] = (p.avgPrice[pair]*actualQty + p.lastCandle[pair].Close*size) / (actualQty + size)
-		p.assets[quote].Free = p.assets[quote].Free - (size * p.lastCandle[pair].Close)
-		p.assets[asset].Free = p.assets[asset].Free + size
+	if size == 0 {
+		return model.Order{}, ErrInvalidQuantity
+	}
+
+	err := p.validateFunds(side, pair, size, p.lastCandle[pair].Close, true)
+	if err != nil {
+		return model.Order{}, err
 	}
 
 	if _, ok := p.volume[pair]; !ok {
@@ -466,16 +645,20 @@ func (p *PaperWallet) createOrderMarket(side model.SideType, pair string, size f
 		Price:      p.lastCandle[pair].Close,
 		Quantity:   size,
 	}
+
 	p.orders = append(p.orders, order)
+
 	return order, nil
 }
 
 func (p *PaperWallet) CreateOrderMarketQuote(side model.SideType, pair string,
-	quantity float64) (model.Order, error) {
+	quoteQuantity float64) (model.Order, error) {
 	p.Lock()
 	defer p.Unlock()
 
-	return p.createOrderMarket(side, pair, quantity/p.lastCandle[pair].Close)
+	info := p.AssetsInfo(pair)
+	quantity := common.AmountToLotSize(info.StepSize, info.BaseAssetPrecision, quoteQuantity/p.lastCandle[pair].Close)
+	return p.createOrderMarket(side, pair, quantity)
 }
 
 func (p *PaperWallet) Cancel(order model.Order) error {
@@ -485,12 +668,27 @@ func (p *PaperWallet) Cancel(order model.Order) error {
 	for i, o := range p.orders {
 		if o.ExchangeID == order.ExchangeID {
 			p.orders[i].Status = model.OrderStatusTypeCanceled
+
+			// unlock funds
+			assset, quote := SplitAssetQuote(o.Pair)
+			// we have open long position
+			if p.assets[assset].Lock > 0 && o.Side == model.SideTypeSell {
+				p.assets[assset].Free += o.Quantity
+				p.assets[assset].Lock -= o.Quantity
+			} else {
+				// we don't have open long position
+				if p.assets[assset].Lock == 0 {
+					amount := order.Price * order.Quantity
+					p.assets[quote].Free += amount
+					p.assets[quote].Lock -= amount
+				}
+			}
 		}
 	}
 	return nil
 }
 
-func (p *PaperWallet) Order(pair string, id int64) (model.Order, error) {
+func (p *PaperWallet) Order(_ string, id int64) (model.Order, error) {
 	for _, order := range p.orders {
 		if order.ExchangeID == id {
 			return order, nil
